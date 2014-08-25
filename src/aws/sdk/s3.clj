@@ -234,41 +234,21 @@
     (s3-client cred)
     (CompleteMultipartUploadRequest. bucket key upload-id e-tags)))
 
-(defn- upload-part
-  [{cred :cred bucket :bucket key :key upload-id :upload-id
-    part-size :part-size offset :offset file :file stream :stream
-    part-number :part-number}]
-  {:pre [(not (and file stream))]}
-  (let [request (UploadPartRequest.)]
-    (doto request
-      (.setBucketName bucket)
-      (.setKey key)
-      (.setUploadId upload-id))
-    (cond
-     file (doto request
-            (.setPartSize (min part-size (- (.length file) offset)))
-            (.setPartNumber (+ 1 (/ offset part-size)))
-            (.setFileOffset offset)
-            (.setFile file))
-     stream (doto request
-              (.setPartSize (min part-size (.available stream)))
-              (.setPartNumber part-number)
-              (.setInputStream stream)))
-    (.getPartETag (.uploadPart (s3-client cred) request))))
 
 (defprotocol MultipartUpload
-  (multipart-upload [value upload options]))
+  (multipart-upload [value upload options])
+  (prepare-upload [value request upload]))
 
+(declare upload-part)
 (extend-protocol MultipartUpload
   java.io.File
-  (multipart-upload [^java.io.File file
+  (multipart-upload [file
                      {:keys [part-size] :as upload}
                      {:keys [threads] :as options
                       :or {threads 16}}]
-    (let [upload  (assoc upload :file file)
-          pool    (Executors/newFixedThreadPool threads)
+    (let [pool    (Executors/newFixedThreadPool threads)
           offsets (range 0 (.length file) part-size)]
-      (try (let [tasks (map #(fn [] (upload-part (assoc upload :offset %)))
+      (try (let [tasks (map #(fn [] (upload-part file (assoc upload :offset %)))
                             offsets)]
              (complete-multipart-upload
               (assoc upload
@@ -279,21 +259,47 @@
              (throw ex))
            (finally
              (.shutdown pool)))))
+  (prepare-upload [file request {part-size :part-size
+                                 offset :offset
+                                 :as upload}]
+    (doto request
+      (.setPartSize (min part-size (- (.length file) offset)))
+      (.setPartNumber (+ 1 (/ offset part-size)))
+            (.setFileOffset offset)
+            (.setFile file)))
   java.io.InputStream
   (multipart-upload [stream upload options]
     (try
-      (let [upload (assoc upload :stream stream)
-            e-tags ((fn get-e-tag [count]
+      (let [e-tags ((fn get-e-tag [count]
                       (lazy-seq
                        (try
-                         (cons (upload-part (assoc upload :part-number count))
+                         (cons (upload-part stream
+                                            (assoc upload :part-number count))
                                (get-e-tag (inc count)))
                          (catch java.io.IOException _ nil))))
                     1)]
         (complete-multipart-upload (assoc upload :e-tags e-tags)))
       (catch Exception ex
         (abort-multipart-upload upload)
-        (throw ex)))))
+        (throw ex))))
+  (prepare-upload [stream request {part-size :part-size
+                                   part-number :part-number
+                                   :as upload}]
+    (doto request
+      (.setPartSize (min part-size (.available stream)))
+      (.setPartNumber part-number)
+      (.setInputStream stream))))
+
+(defn- upload-part
+  [source {cred :cred bucket :bucket key :key upload-id :upload-id
+           :as upload}]
+  (let [request (UploadPartRequest.)]
+    (doto request
+      (.setBucketName bucket)
+      (.setKey key)
+      (.setUploadId upload-id))
+    (prepare-upload source request upload)
+    (.getPartETag (.uploadPart (s3-client cred) request))))
 
 (defn put-multipart-object
   "Do a multipart upload of a file or input-stream into a S3 bucket at the
